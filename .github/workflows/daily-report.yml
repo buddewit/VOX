@@ -1,6 +1,6 @@
 name: Daily MightPulse report
 
-on:
+"on":
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch: {}
