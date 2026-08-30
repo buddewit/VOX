@@ -1,0 +1,41 @@
+name: Daily MightPulse report
+
+on:
+  schedule:
+    # Runs at 06:00 UTC every day. GitHub may delay a few minutes under load.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write  # needed to commit the updated snapshot file back
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run report
+        env:
+          MIGHTPULSE_API_KEY: ${{ secrets.MIGHTPULSE_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          KINGDOM_ID: ${{ vars.KINGDOM_ID }}
+          ALLIANCE_TAG: ${{ vars.ALLIANCE_TAG }}
+        run: python report.py
+
+      - name: Commit updated snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_snapshot.json
+          git diff --staged --quiet || git commit -m "Update power snapshot [skip ci]"
+          git push
