@@ -15,7 +15,7 @@ from pathlib import Path
 
 import requests
 
-MIGHTPULSE_API_KEY = os.environ["kss_ykbr0QiJT5OXGNh1aQkGE7R2BpqxXWMXtPmEQ0TYgWc"]
+MIGHTPULSE_API_KEY = os.environ["kss_o6h_tD9UJQUUBKASNec3Ay3pBaQaHwxML9oLCnXx5vA"]
 DISCORD_WEBHOOK_URL = os.environ["https://discord.com/api/webhooks/1543629501001498795/nytly6oh70miibm0a8zBmzcauDxefiCTKVDZqclJ3OK635maMk04AslsOriPuu7Zoa_2"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
 ALLIANCE_TAG = os.environ.get("ALLIANCE_TAG", "VOX")
