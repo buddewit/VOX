@@ -5,11 +5,18 @@ Runs once, posts a daily power-progression summary for your Kingshot
 alliance to a Discord channel via a webhook, then exits. Designed to be
 triggered on a schedule by GitHub Actions (see .github/workflows/daily-report.yml)
 rather than run as a long-lived bot.
+
+The alliance-roster endpoint's power/activity fields lag behind reality
+(batch-refreshed on MightPulse's side), while the per-player endpoint is
+accurate (checked live on request). So this script uses the alliance
+endpoint only to get the current member list, then re-fetches each member
+individually for accurate power/last-active data.
 """
 
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,17 +29,43 @@ ALLIANCE_TAG = os.environ.get("ALLIANCE_TAG", "VOX")
 
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
+REQUEST_DELAY_SECONDS = 1.1  # stays under the 60/min limit with margin
+
+
+def api_get(path: str, params: dict | None = None) -> dict:
+    url = f"{API_BASE}{path}"
+    headers = {"Authorization": f"Bearer {MIGHTPULSE_API_KEY}"}
+
+    resp = requests.get(url, headers=headers, params=params or {}, timeout=30)
+    if resp.status_code == 429:
+        # brief backoff and one retry if we ever bump the rate limit
+        time.sleep(5)
+        resp = requests.get(url, headers=headers, params=params or {}, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"MightPulse API {resp.status_code} on {path}: {resp.text}")
+    return resp.json()
 
 
 def fetch_roster() -> dict:
-    url = f"{API_BASE}/alliances/{KINGDOM_ID}/{ALLIANCE_TAG}"
-    headers = {"Authorization": f"Bearer {MIGHTPULSE_API_KEY}"}
-    params = {"include": "info,roster"}
+    """Alliance totals + member list. Member power/activity here can lag;
+    only the member IDs/names are trusted from this call."""
+    return api_get(f"/alliances/{KINGDOM_ID}/{ALLIANCE_TAG}", {"include": "info,roster"})
 
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"MightPulse API {resp.status_code}: {resp.text}")
-    return resp.json()
+
+def fetch_fresh_members(members: list[dict]) -> list[dict]:
+    """Re-fetch each member individually for accurate, live power/activity."""
+    fresh = []
+    for i, m in enumerate(members):
+        gid = m["governor_id"]
+        try:
+            data = api_get(f"/players/{gid}", {"include": "base"})
+            fresh.append(data["player"])
+        except Exception as exc:
+            print(f"WARNING: couldn't refresh {m.get('nick_name', gid)} ({gid}): {exc}", file=sys.stderr)
+            fresh.append(m)  # fall back to the (stale) roster entry rather than dropping them
+        if i < len(members) - 1:
+            time.sleep(REQUEST_DELAY_SECONDS)
+    return fresh
 
 
 def load_snapshot() -> dict:
@@ -48,6 +81,7 @@ def save_snapshot(members: list[dict]) -> None:
 
 def build_payload(alliance: dict, members: list[dict], previous: dict) -> dict:
     ranked = sorted(members, key=lambda m: m["power"], reverse=True)
+    total_power = sum(m["power"] for m in members)  # summed from fresh per-player data, not the (laggy) alliance total
 
     lines = []
     for m in ranked:
@@ -70,7 +104,7 @@ def build_payload(alliance: dict, members: list[dict], previous: dict) -> dict:
 
     embed = {
         "title": f"[{alliance['abbr']}] {alliance['name']} — daily power report",
-        "description": f"Kingdom {alliance['kid']} · Total power: {alliance['power']:,} · Members: {alliance['count']}",
+        "description": f"Kingdom {alliance['kid']} · Total power: {total_power:,} · Members: {len(members)}",
         "color": 0x5865F2,  # Discord blurple
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
@@ -87,14 +121,14 @@ def post_to_discord(payload: dict) -> None:
 def main() -> None:
     data = fetch_roster()
     alliance = data["alliance"]
-    members = data["members"]
+    members = fetch_fresh_members(data["members"])
 
     previous = load_snapshot()
     payload = build_payload(alliance, members, previous)
     post_to_discord(payload)
     save_snapshot(members)
 
-    print(f"Posted report for [{alliance['abbr']}] — {alliance['power']:,} total power, {alliance['count']} members")
+    print(f"Posted report for [{alliance['abbr']}] — {sum(m['power'] for m in members):,} total power, {len(members)} members")
 
 
 if __name__ == "__main__":
