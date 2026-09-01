@@ -88,24 +88,28 @@ def extract_uid(member: dict) -> str | None:
     return None
 
 
-def refresh_by_uid(page, uid: str) -> bool:
-    """Navigate straight to the profile page and click refresh."""
+def refresh_by_uid(page, uid: str) -> str:
+    """Navigate to the profile page — the page load itself triggers the
+    live-data refresh, no button click needed.
+
+    Returns "visited" or "error".
+    """
     try:
         page.goto(f"https://mightpulse.com/player/{uid}", timeout=PAGE_LOAD_TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
-
-        refresh_button = page.get_by_text("Refresh", exact=False).first
-        refresh_button.click(timeout=5000)
-
         page.wait_for_timeout(PER_MEMBER_PAUSE_MS)
-        return True
+        return "visited"
     except Exception as exc:
-        print(f"WARNING: could not refresh uid={uid}: {exc}", file=sys.stderr)
-        return False
+        print(f"WARNING: could not visit uid={uid}: {exc}", file=sys.stderr)
+        return "error"
 
 
-def refresh_by_search(page, kingdom_id: str, governor_id: str, nick_name: str) -> bool:
-    """Fallback: search for a member on the kingdom page and click their refresh control."""
+def refresh_by_search(page, kingdom_id: str, governor_id: str, nick_name: str) -> str:
+    """Fallback: search for a member on the kingdom page and open their
+    profile — the page load itself triggers the refresh, no click needed.
+
+    Returns "visited", "not_found", or "error".
+    """
     try:
         page.goto(f"https://mightpulse.com/kingdom/{kingdom_id}", timeout=PAGE_LOAD_TIMEOUT_MS)
         page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
@@ -115,24 +119,24 @@ def refresh_by_search(page, kingdom_id: str, governor_id: str, nick_name: str) -
         page.wait_for_timeout(1200)
 
         result = page.locator("text=" + str(governor_id)).first
+        if result.count() == 0:
+            print(f"WARNING: no search result for {nick_name} ({governor_id})", file=sys.stderr)
+            return "not_found"
+
         result.click(timeout=5000)
-        page.wait_for_timeout(800)
-
-        refresh_button = page.get_by_text("Refresh", exact=False).first
-        refresh_button.click(timeout=5000)
-
+        page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
         page.wait_for_timeout(PER_MEMBER_PAUSE_MS)
-        return True
+        return "visited"
     except Exception as exc:
-        print(f"WARNING: could not refresh {nick_name} ({governor_id}) via search: {exc}", file=sys.stderr)
-        return False
+        print(f"WARNING: could not visit {nick_name} ({governor_id}) via search: {exc}", file=sys.stderr)
+        return "error"
 
 
 def main() -> None:
     members = get_member_ids()
     print(f"Refreshing {len(members)} members on mightpulse.com...")
 
-    succeeded, failed = 0, 0
+    tally = {"visited": 0, "not_found": 0, "error": 0}
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page()
@@ -143,17 +147,20 @@ def main() -> None:
 
             uid = resolve_uid_via_api(governor_id) or extract_uid(m)
             if uid:
-                ok = refresh_by_uid(page, uid)
+                result = refresh_by_uid(page, uid)
             else:
-                ok = refresh_by_search(page, KINGDOM_ID, governor_id, nick_name)
+                result = refresh_by_search(page, KINGDOM_ID, governor_id, nick_name)
 
-            succeeded += ok
-            failed += not ok
+            tally[result] = tally.get(result, 0) + 1
 
         browser.close()
 
-    print(f"Refresh pass done: {succeeded} succeeded, {failed} failed.")
-    # Don't hard-fail the whole run over a few missed refreshes — report.py
+    print(
+        f"Refresh pass done: {tally['visited']} visited, "
+        f"{tally['not_found']} not found, "
+        f"{tally['error']} errored."
+    )
+    # Don't hard-fail the whole run over a few missed visits — report.py
     # will just show stale data for those, which is the status quo today.
 
 
