@@ -2,8 +2,9 @@ name: Daily MightPulse report
 
 "on":
   schedule:
+    # Runs at 06:00 UTC every day. GitHub may delay a few minutes under load.
     - cron: "0 6 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
 permissions:
   contents: write  # needed to commit the updated snapshot file back
@@ -21,7 +22,16 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Refresh members on mightpulse.com
+        env:
+          MIGHTPULSE_API_KEY: ${{ secrets.MIGHTPULSE_API_KEY }}
+          KINGDOM_ID: ${{ vars.KINGDOM_ID }}
+          ALLIANCE_TAG: ${{ vars.ALLIANCE_TAG }}
+        run: python refresh_members.py
 
       - name: Run report
         env:
