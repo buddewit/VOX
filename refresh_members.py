@@ -13,14 +13,21 @@ each roster member's uid via the API (fast, reliable, one call per member).
 If that param value turns out to be wrong/unsupported, it falls back to the
 roster payload possibly already containing a uid-like field, and finally to
 the old search-and-click flow using governor_id / nick_name.
+
+Member visits now run concurrently (multiple browser tabs at once, each in
+its own isolated context) instead of one at a time, and the uid-resolution
+API calls are paced/retried the same way report.py's api_get is. Both
+CONCURRENCY and the API rate limit are tunable via env vars below.
 """
 
+import asyncio
 import os
 import sys
-
-from playwright.sync_api import sync_playwright
+import time
+from collections import deque
 
 import requests
+from playwright.async_api import Browser, Page, async_playwright
 
 MIGHTPULSE_API_KEY = os.environ["MIGHTPULSE_API_KEY"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
@@ -29,6 +36,11 @@ API_BASE = "https://api.mightpulse.com/v1"
 
 PAGE_LOAD_TIMEOUT_MS = 20_000
 PER_MEMBER_PAUSE_MS = 2_500  # give the backend time to process the refresh
+
+# How many profile pages to have open/loading at once, and how many
+# uid-resolution API calls per minute to allow across all of them.
+CONCURRENCY = int(os.environ.get("MIGHTPULSE_REFRESH_CONCURRENCY", "5"))
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("MIGHTPULSE_REFRESH_RATE_LIMIT_PER_MIN", "55"))
 
 # Keys we'll check, in order, to find the profile uid already sitting in a
 # roster member dict (used only if the /players lookup below fails).
@@ -42,15 +54,51 @@ UID_CANDIDATE_KEYS = ["uid", "player_id", "profile_id", "profile_uid"]
 PLAYER_LOOKUP_ID_TYPES = ["governor_id"]
 
 
-def resolve_uid_via_api(governor_id: str) -> str | None:
+class AsyncRateLimiter:
+    """Sliding-window limiter for coroutines: at most `max_calls` acquisitions
+    in any rolling `period` seconds, no matter how many tasks share it."""
+
+    def __init__(self, max_calls: int, period: float):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls: deque[float] = deque()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        while True:
+            async with self.lock:
+                now = time.monotonic()
+                while self.calls and now - self.calls[0] >= self.period:
+                    self.calls.popleft()
+                if len(self.calls) < self.max_calls:
+                    self.calls.append(now)
+                    return
+                sleep_for = self.period - (now - self.calls[0])
+            await asyncio.sleep(max(sleep_for, 0.01))
+
+
+async def resolve_uid_via_api(governor_id: str, rate_limiter: AsyncRateLimiter) -> str | None:
     """Try to resolve a roster governor_id to a profile uid via the players
     lookup endpoint. Returns None if no configured id_type works, so the
-    caller can fall back to other strategies."""
+    caller can fall back to other strategies.
+
+    The actual HTTP call is blocking (requests), so it runs in a thread via
+    asyncio.to_thread — that keeps the event loop free for the browser pages
+    while still being paced by the shared rate limiter."""
     headers = {"Authorization": f"Bearer {MIGHTPULSE_API_KEY}"}
-    for id_type in PLAYER_LOOKUP_ID_TYPES:
+
+    def _get(id_type: str):
         url = f"{API_BASE}/players/{governor_id}"
-        try:
+        resp = requests.get(url, headers=headers, params={"id_type": id_type}, timeout=15)
+        if resp.status_code == 429:
+            time.sleep(5)
             resp = requests.get(url, headers=headers, params={"id_type": id_type}, timeout=15)
+        return resp
+
+    for id_type in PLAYER_LOOKUP_ID_TYPES:
+        await rate_limiter.acquire()
+        try:
+            resp = await asyncio.to_thread(_get, id_type)
             if resp.status_code == 200:
                 data = resp.json()
                 uid = data.get("uid") or data.get("id")
@@ -88,72 +136,93 @@ def extract_uid(member: dict) -> str | None:
     return None
 
 
-def refresh_by_uid(page, uid: str) -> str:
+async def refresh_by_uid(page: Page, uid: str) -> str:
     """Navigate to the profile page — the page load itself triggers the
     live-data refresh, no button click needed.
 
     Returns "visited" or "error".
     """
     try:
-        page.goto(f"https://mightpulse.com/player/{uid}", timeout=PAGE_LOAD_TIMEOUT_MS)
-        page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
-        page.wait_for_timeout(PER_MEMBER_PAUSE_MS)
+        await page.goto(f"https://mightpulse.com/player/{uid}", timeout=PAGE_LOAD_TIMEOUT_MS)
+        await page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+        await page.wait_for_timeout(PER_MEMBER_PAUSE_MS)
         return "visited"
     except Exception as exc:
         print(f"WARNING: could not visit uid={uid}: {exc}", file=sys.stderr)
         return "error"
 
 
-def refresh_by_search(page, kingdom_id: str, governor_id: str, nick_name: str) -> str:
+async def refresh_by_search(page: Page, kingdom_id: str, governor_id: str, nick_name: str) -> str:
     """Fallback: search for a member on the kingdom page and open their
     profile — the page load itself triggers the refresh, no click needed.
 
     Returns "visited", "not_found", or "error".
     """
     try:
-        page.goto(f"https://mightpulse.com/kingdom/{kingdom_id}", timeout=PAGE_LOAD_TIMEOUT_MS)
-        page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+        await page.goto(f"https://mightpulse.com/kingdom/{kingdom_id}", timeout=PAGE_LOAD_TIMEOUT_MS)
+        await page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
 
         search_box = page.get_by_placeholder("Search by name, governor ID, or keyword")
-        search_box.fill(str(governor_id))
-        page.wait_for_timeout(1200)
+        await search_box.fill(str(governor_id))
+        await page.wait_for_timeout(1200)
 
         result = page.locator("text=" + str(governor_id)).first
-        if result.count() == 0:
+        if await result.count() == 0:
             print(f"WARNING: no search result for {nick_name} ({governor_id})", file=sys.stderr)
             return "not_found"
 
-        result.click(timeout=5000)
-        page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
-        page.wait_for_timeout(PER_MEMBER_PAUSE_MS)
+        await result.click(timeout=5000)
+        await page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+        await page.wait_for_timeout(PER_MEMBER_PAUSE_MS)
         return "visited"
     except Exception as exc:
         print(f"WARNING: could not visit {nick_name} ({governor_id}) via search: {exc}", file=sys.stderr)
         return "error"
 
 
-def main() -> None:
-    members = get_member_ids()
-    print(f"Refreshing {len(members)} members on mightpulse.com...")
+async def process_member(
+    m: dict,
+    browser: Browser,
+    semaphore: asyncio.Semaphore,
+    rate_limiter: AsyncRateLimiter,
+) -> str:
+    governor_id = m["governor_id"]
+    nick_name = m.get("nick_name", "?")
 
-    tally = {"visited": 0, "not_found": 0, "error": 0}
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page()
+    # Resolve the uid BEFORE taking a browser slot, so API latency doesn't
+    # hog a concurrency slot that could be loading another member's page.
+    uid = await resolve_uid_via_api(governor_id, rate_limiter) or extract_uid(m)
 
-        for m in members:
-            governor_id = m["governor_id"]
-            nick_name = m.get("nick_name", "?")
-
-            uid = resolve_uid_via_api(governor_id) or extract_uid(m)
+    async with semaphore:
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
             if uid:
-                result = refresh_by_uid(page, uid)
+                result = await refresh_by_uid(page, uid)
             else:
-                result = refresh_by_search(page, KINGDOM_ID, governor_id, nick_name)
+                result = await refresh_by_search(page, KINGDOM_ID, governor_id, nick_name)
+        finally:
+            await context.close()
 
-            tally[result] = tally.get(result, 0) + 1
+    return result
 
-        browser.close()
+
+async def main_async() -> None:
+    members = get_member_ids()
+    print(f"Refreshing {len(members)} members on mightpulse.com (concurrency={CONCURRENCY})...")
+
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    rate_limiter = AsyncRateLimiter(RATE_LIMIT_PER_MINUTE, 60.0)
+    tally = {"visited": 0, "not_found": 0, "error": 0}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        try:
+            tasks = [process_member(m, browser, semaphore, rate_limiter) for m in members]
+            for result in await asyncio.gather(*tasks):
+                tally[result] = tally.get(result, 0) + 1
+        finally:
+            await browser.close()
 
     print(
         f"Refresh pass done: {tally['visited']} visited, "
@@ -162,6 +231,10 @@ def main() -> None:
     )
     # Don't hard-fail the whole run over a few missed visits — report.py
     # will just show stale data for those, which is the status quo today.
+
+
+def main() -> None:
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
