@@ -52,18 +52,18 @@ DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
 ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))  # top N alliances by power; API caps this at 100
 
+API_BASE = "https://api.mightpulse.com/v1"
+SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
+WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
+TOP_N = 20
+WEEKLY_RESET_DAYS = 7
+
 # How many provisional top-gainers (per period: daily, weekly) get verified
 # with a real per-player call before final ranking. Bounds verification cost
 # to roughly 2x this number per run, regardless of kingdom size. Must be
 # comfortably larger than TOP_N so the true top 20 isn't cut by stale
 # roster-based provisional ranking.
 VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(TOP_N * 5)))
-
-API_BASE = "https://api.mightpulse.com/v1"
-SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
-WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
-TOP_N = 20
-WEEKLY_RESET_DAYS = 7
 
 # Per-player refetching is now done concurrently instead of one-request-at-a-
 # time. RATE_LIMIT_PER_MINUTE caps total calls across all workers so we stay
