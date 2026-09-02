@@ -1,16 +1,25 @@
 """
 MightPulse -> Discord webhook report
 
-Runs once, posts a power-progression summary for your Kingshot alliance to a
-Discord channel via a webhook, then exits. Designed to be triggered on a
-schedule by GitHub Actions (see .github/workflows/daily-report.yml) rather
-than run as a long-lived bot.
+Runs once, posts a kingdom-wide power-progression summary to a Discord
+channel via a webhook, then exits. Designed to be triggered on a schedule
+by GitHub Actions (see .github/workflows/daily-report.yml) rather than run
+as a long-lived bot.
 
-The alliance-roster endpoint's power/activity fields lag behind reality
-(batch-refreshed on MightPulse's side), while the per-player endpoint is
-accurate (checked live on request). So this script uses the alliance
-endpoint only to get the current member list, then re-fetches each member
-individually for accurate power/last-active data.
+Scope: the top ALLIANCE_LIMIT alliances (by power) in KINGDOM_ID, resolved
+fresh each run via /kingdoms/{kid}/ranks?board=alliance_power — there is no
+longer a single fixed ALLIANCE_TAG. Every one of those alliances' rosters is
+pulled via /alliances/{kid}/{tag}?include=roster.
+
+Per MightPulse's docs, player and alliance responses share the same
+freshness model (each up to 60 min old, refreshed per-section on request,
+with up to a 90s wait for a stale section to update). There's no documented
+basis for alliance-roster power lagging behind per-player power, so unlike
+the original single-alliance version of this script, we do NOT re-fetch
+each member individually — that would mean thousands of extra calls across
+100 alliances for no documented accuracy gain. Roster power is used as-is.
+If that assumption ever turns out to be wrong in practice, re-enable
+VERIFY_WITH_PER_PLAYER_REFRESH (see below) rather than reverting silently.
 
 Report contents:
   - Top 20 members by power gained since the previous run (daily).
@@ -22,7 +31,10 @@ Each line shows: name, current power, (power gained / % gained).
 import json
 import os
 import sys
+import threading
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -31,17 +43,56 @@ import requests
 MIGHTPULSE_API_KEY = os.environ["MIGHTPULSE_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
-ALLIANCE_TAG = os.environ.get("ALLIANCE_TAG", "VOX")
+ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))  # top N alliances by power; API caps this at 100
+
+# Off by default — see docstring. Set to "1" to fall back to the old
+# per-player re-fetch pass, e.g. if roster power ever looks stale in practice.
+VERIFY_WITH_PER_PLAYER_REFRESH = os.environ.get("VERIFY_WITH_PER_PLAYER_REFRESH", "0") == "1"
 
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
 WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
-REQUEST_DELAY_SECONDS = 1.1  # stays under the 60/min limit with margin
 TOP_N = 20
 WEEKLY_RESET_DAYS = 7
 
+# Per-player refetching is now done concurrently instead of one-request-at-a-
+# time. RATE_LIMIT_PER_MINUTE caps total calls across all workers so we stay
+# under MightPulse's 60/min limit (with margin); MAX_WORKERS controls how
+# many requests can be in flight at once, which is what actually hides
+# network latency. Both are overridable via env vars if needed.
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("MIGHTPULSE_RATE_LIMIT_PER_MIN", "55"))
+MAX_WORKERS = int(os.environ.get("MIGHTPULSE_MAX_WORKERS", "8"))
+
+
+class RateLimiter:
+    """Thread-safe sliding-window limiter: blocks callers so that no more
+    than `max_calls` acquisitions happen in any rolling `period` seconds,
+    no matter how many threads are calling it."""
+
+    def __init__(self, max_calls: int, period: float):
+        self.max_calls = max_calls
+        self.period = period
+        self.calls: deque[float] = deque()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                while self.calls and now - self.calls[0] >= self.period:
+                    self.calls.popleft()
+                if len(self.calls) < self.max_calls:
+                    self.calls.append(now)
+                    return
+                sleep_for = self.period - (now - self.calls[0])
+            time.sleep(max(sleep_for, 0.01))
+
+
+_rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE, 60.0)
+
 
 def api_get(path: str, params: dict | None = None) -> dict:
+    _rate_limiter.acquire()
     url = f"{API_BASE}{path}"
     headers = {"Authorization": f"Bearer {MIGHTPULSE_API_KEY}"}
 
@@ -55,25 +106,79 @@ def api_get(path: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
-def fetch_roster() -> dict:
-    """Alliance totals + member list. Member power/activity here can lag;
-    only the member IDs/names are trusted from this call."""
-    return api_get(f"/alliances/{KINGDOM_ID}/{ALLIANCE_TAG}", {"include": "info,roster"})
+def fetch_top_alliances(kid: str, limit: int = ALLIANCE_LIMIT) -> list[dict]:
+    """Top alliances in this kingdom by power, already ranked by the API.
+    Each entry has at least aid, abbr, name, score per the docs.
+
+    The docs don't spell out the top-level key holding the list for this
+    endpoint (unlike e.g. the roster endpoint, which is documented down to
+    field names), so we try the most likely candidates and fail loudly with
+    the actual response shape if none match — better than silently guessing
+    wrong and returning an empty/garbage alliance list."""
+    data = api_get(f"/kingdoms/{kid}/ranks", {"board": "alliance_power", "limit": limit})
+    for key in ("ranks", "board", "results", "items", "leaderboard", "data"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    raise RuntimeError(
+        f"Couldn't find the alliance list in /kingdoms/{kid}/ranks response "
+        f"— got top-level keys {sorted(data.keys())}. Check the actual response "
+        f"shape and add the right key to fetch_top_alliances()."
+    )
 
 
-def fetch_fresh_members(members: list[dict]) -> list[dict]:
-    """Re-fetch each member individually for accurate, live power/activity."""
-    fresh = []
-    for i, m in enumerate(members):
+def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], list[dict]]:
+    """Fetch every listed alliance's roster concurrently (up to MAX_WORKERS
+    at a time, paced by the shared RateLimiter). Returns (all_members,
+    alliance_infos) — a flat member list across all alliances, plus each
+    alliance's own info dict (for a total-power/member-count summary)."""
+    alliance_infos: list[dict | None] = [None] * len(alliance_tags)
+    members_by_index: list[list[dict]] = [[] for _ in alliance_tags]
+
+    def fetch_one(i: int, tag: str) -> tuple[int, dict | None, list[dict]]:
+        try:
+            data = api_get(f"/alliances/{kid}/{tag}", {"include": "info,roster"})
+            return i, data["alliance"], data["members"]
+        except Exception as exc:
+            print(f"WARNING: couldn't fetch roster for alliance {tag}: {exc}", file=sys.stderr)
+            return i, None, []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_one, i, tag) for i, tag in enumerate(alliance_tags)]
+        for future in as_completed(futures):
+            i, alliance, members = future.result()
+            alliance_infos[i] = alliance
+            members_by_index[i] = members
+
+    all_members = [m for members in members_by_index for m in members]
+    ok_alliance_infos = [a for a in alliance_infos if a is not None]
+    return all_members, ok_alliance_infos
+
+
+def refresh_members_individually(members: list[dict]) -> list[dict]:
+    """Optional fallback: re-fetch each member individually for live
+    power/activity, in case roster power ever turns out to lag in practice
+    despite the docs saying otherwise. Off by default — see module
+    docstring — because at kingdom scale (thousands of members across 100
+    alliances) this is thousands of extra calls for an assumption the docs
+    don't support. Enable via VERIFY_WITH_PER_PLAYER_REFRESH=1."""
+    fresh: list[dict | None] = [None] * len(members)
+
+    def fetch_one(i: int, m: dict) -> tuple[int, dict]:
         gid = m["governor_id"]
         try:
             data = api_get(f"/players/{gid}", {"include": "base"})
-            fresh.append(data["player"])
+            return i, data["player"]
         except Exception as exc:
             print(f"WARNING: couldn't refresh {m.get('nick_name', gid)} ({gid}): {exc}", file=sys.stderr)
-            fresh.append(m)  # fall back to the (stale) roster entry rather than dropping them
-        if i < len(members) - 1:
-            time.sleep(REQUEST_DELAY_SECONDS)
+            return i, m  # fall back to the (stale) roster entry rather than dropping them
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(fetch_one, i, m) for i, m in enumerate(members)]
+        for future in as_completed(futures):
+            i, player = future.result()
+            fresh[i] = player
+
     return fresh
 
 
@@ -174,13 +279,14 @@ def chunk_field(label: str, text: str, max_len: int = 1000) -> list[dict]:
 
 
 def build_payload(
-    alliance: dict,
+    kingdom_id: str,
+    alliance_count: int,
     members: list[dict],
     daily_previous: dict,
     weekly_previous: dict,
     weekly_just_reset: bool,
 ) -> dict:
-    total_power = sum(m["power"] for m in members)  # summed from fresh per-player data, not the (laggy) alliance total
+    total_power = sum(m["power"] for m in members)
 
     fields = []
 
@@ -200,8 +306,8 @@ def build_payload(
             fields.append({"name": "Top Weekly Gainers (7d)", "value": "No comparable data yet.", "inline": False})
 
     embed = {
-        "title": f"[{alliance['abbr']}] {alliance['name']} — power report",
-        "description": f"Kingdom {alliance['kid']} · Total power: {total_power:,} · Members: {len(members)}",
+        "title": f"Kingdom {kingdom_id} — top {alliance_count} alliances power report",
+        "description": f"Alliances tracked: {alliance_count} · Members: {len(members)} · Total power: {total_power:,}",
         "color": 0x5865F2,  # Discord blurple
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
@@ -218,19 +324,24 @@ def post_to_discord(payload: dict) -> None:
 def main() -> None:
     now = datetime.now(timezone.utc)
 
-    data = fetch_roster()
-    alliance = data["alliance"]
-    members = fetch_fresh_members(data["members"])
+    top_alliances = fetch_top_alliances(KINGDOM_ID, ALLIANCE_LIMIT)
+    alliance_tags = [a["abbr"] for a in top_alliances]
+    print(f"Resolved {len(alliance_tags)} top alliances by power in kingdom {KINGDOM_ID}")
+
+    members, alliance_infos = fetch_all_rosters(KINGDOM_ID, alliance_tags)
+
+    if VERIFY_WITH_PER_PLAYER_REFRESH:
+        members = refresh_members_individually(members)
 
     daily_previous = load_snapshot()
     weekly_previous, weekly_just_reset = get_weekly_baseline(members, now)
 
-    payload = build_payload(alliance, members, daily_previous, weekly_previous, weekly_just_reset)
+    payload = build_payload(KINGDOM_ID, len(alliance_infos), members, daily_previous, weekly_previous, weekly_just_reset)
     post_to_discord(payload)
 
     save_snapshot(members)  # weekly snapshot is only (re)written on reset, inside get_weekly_baseline
 
-    print(f"Posted report for [{alliance['abbr']}] — {sum(m['power'] for m in members):,} total power, {len(members)} members")
+    print(f"Posted report — {len(alliance_infos)} alliances, {sum(m['power'] for m in members):,} total power, {len(members)} members")
 
 
 if __name__ == "__main__":
