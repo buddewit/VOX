@@ -12,14 +12,21 @@ longer a single fixed ALLIANCE_TAG. Every one of those alliances' rosters is
 pulled via /alliances/{kid}/{tag}?include=roster.
 
 Per MightPulse's docs, player and alliance responses share the same
-freshness model (each up to 60 min old, refreshed per-section on request,
-with up to a 90s wait for a stale section to update). There's no documented
-basis for alliance-roster power lagging behind per-player power, so unlike
-the original single-alliance version of this script, we do NOT re-fetch
-each member individually — that would mean thousands of extra calls across
-100 alliances for no documented accuracy gain. Roster power is used as-is.
-If that assumption ever turns out to be wrong in practice, re-enable
-VERIFY_WITH_PER_PLAYER_REFRESH (see below) rather than reverting silently.
+freshness model on paper (each up to 60 min old, refreshed per-section on
+request). In practice, roster power has been observed to lag behind a
+direct per-player check — confirmed by comparing a report against live
+per-player data — so per-player verification is real and necessary, not
+optional.
+
+Verifying every member individually doesn't scale to 100 alliances though
+(potentially thousands of members vs. a 5,000/day call cap). So instead:
+roster data is used to compute a *provisional* gain ranking first, then only
+the top VERIFY_CANDIDATE_POOL provisional gainers (daily and weekly pools,
+unioned) get a real per-player refresh, and the final top-20 lists are
+ranked from that verified subset. This assumes the true top 20 gainers are
+within the wider candidate pool even using stale roster numbers — a
+reasonable bet with a 5x-or-more pool, but not a guarantee. Widen
+VERIFY_CANDIDATE_POOL if you suspect it's cutting anyone real gainers.
 
 Report contents:
   - Top 20 members by power gained since the previous run (daily).
@@ -45,9 +52,12 @@ DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
 ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))  # top N alliances by power; API caps this at 100
 
-# Off by default — see docstring. Set to "1" to fall back to the old
-# per-player re-fetch pass, e.g. if roster power ever looks stale in practice.
-VERIFY_WITH_PER_PLAYER_REFRESH = os.environ.get("VERIFY_WITH_PER_PLAYER_REFRESH", "0") == "1"
+# How many provisional top-gainers (per period: daily, weekly) get verified
+# with a real per-player call before final ranking. Bounds verification cost
+# to roughly 2x this number per run, regardless of kingdom size. Must be
+# comfortably larger than TOP_N so the true top 20 isn't cut by stale
+# roster-based provisional ranking.
+VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(TOP_N * 5)))
 
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
@@ -156,12 +166,12 @@ def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], l
 
 
 def refresh_members_individually(members: list[dict]) -> list[dict]:
-    """Optional fallback: re-fetch each member individually for live
-    power/activity, in case roster power ever turns out to lag in practice
-    despite the docs saying otherwise. Off by default — see module
-    docstring — because at kingdom scale (thousands of members across 100
-    alliances) this is thousands of extra calls for an assumption the docs
-    don't support. Enable via VERIFY_WITH_PER_PLAYER_REFRESH=1."""
+    """Re-fetch each given member individually for live, accurate
+    power/activity — confirmed necessary (roster power has been observed to
+    lag in practice). The caller scopes `members` to a bounded candidate
+    pool rather than passing everyone, since at kingdom scale (thousands of
+    members across 100 alliances) verifying every member every run isn't
+    feasible under the daily call cap."""
     fresh: list[dict | None] = [None] * len(members)
 
     def fetch_one(i: int, m: dict) -> tuple[int, dict]:
@@ -180,6 +190,26 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
             fresh[i] = player
 
     return fresh
+
+
+def provisional_gain_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
+    """Rank members by gain using whatever power we currently have (roster
+    data, possibly stale) and return the top `pool_size`. This is a
+    shortlist for verification, not the final ranking — only members with a
+    previous data point can be ranked at all, same as top_gainers()."""
+    candidates = [m for m in members if str(m["governor_id"]) in previous]
+    candidates.sort(
+        key=lambda m: m["power"] - previous[str(m["governor_id"])],
+        reverse=True,
+    )
+    return candidates[:pool_size]
+
+
+def apply_verified(members: list[dict], verified: list[dict]) -> list[dict]:
+    """Replace entries in `members` with their verified counterparts (by
+    governor_id), leaving everyone else's roster data untouched."""
+    verified_by_gid = {str(m["governor_id"]): m for m in verified}
+    return [verified_by_gid.get(str(m["governor_id"]), m) for m in members]
 
 
 # ---------------------------------------------------------------------------
@@ -330,11 +360,23 @@ def main() -> None:
 
     members, alliance_infos = fetch_all_rosters(KINGDOM_ID, alliance_tags)
 
-    if VERIFY_WITH_PER_PLAYER_REFRESH:
-        members = refresh_members_individually(members)
-
     daily_previous = load_snapshot()
     weekly_previous, weekly_just_reset = get_weekly_baseline(members, now)
+
+    # Shortlist provisional gainers (roster data, possibly stale) for daily
+    # and weekly separately, union them, and only verify that bounded set
+    # individually — see module docstring for why we don't verify everyone.
+    candidate_pool: dict[str, dict] = {}
+    for m in provisional_gain_candidates(members, daily_previous, VERIFY_CANDIDATE_POOL):
+        candidate_pool[str(m["governor_id"])] = m
+    if not weekly_just_reset:
+        for m in provisional_gain_candidates(members, weekly_previous, VERIFY_CANDIDATE_POOL):
+            candidate_pool[str(m["governor_id"])] = m
+
+    if candidate_pool:
+        verified = refresh_members_individually(list(candidate_pool.values()))
+        members = apply_verified(members, verified)
+        print(f"Verified {len(verified)} provisional-gainer candidates individually")
 
     payload = build_payload(KINGDOM_ID, len(alliance_infos), members, daily_previous, weekly_previous, weekly_just_reset)
     post_to_discord(payload)
