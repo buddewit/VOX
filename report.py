@@ -1,38 +1,8 @@
 """
 MightPulse -> Discord webhook report
-
 Runs once, posts a kingdom-wide power-progression summary to a Discord
-channel via a webhook, then exits. Designed to be triggered on a schedule
-by GitHub Actions (see .github/workflows/daily-report.yml) rather than run
-as a long-lived bot.
-
-Scope: the top ALLIANCE_LIMIT alliances (by power) in KINGDOM_ID, resolved
-fresh each run via /kingdoms/{kid}/ranks?board=alliance_power — there is no
-longer a single fixed ALLIANCE_TAG. Every one of those alliances' rosters is
-pulled via /alliances/{kid}/{tag}?include=roster.
-
-Per MightPulse's docs, player and alliance responses share the same
-freshness model on paper (each up to 60 min old, refreshed per-section on
-request). In practice, roster power has been observed to lag behind a
-direct per-player check — confirmed by comparing a report against live
-per-player data — so per-player verification is real and necessary, not
-optional.
-
-Verifying every member individually doesn't scale to 100 alliances though
-(potentially thousands of members vs. a 5,000/day call cap). So instead:
-roster data is used to compute a *provisional* gain ranking first, then only
-the top VERIFY_CANDIDATE_POOL provisional gainers get a real per-player
-refresh, and the final top-N list is ranked from that verified subset. This
-assumes the true top N gainers are within the wider candidate pool even
-using stale roster numbers — a reasonable bet with a 5x-or-more pool, but
-not a guarantee. Widen VERIFY_CANDIDATE_POOL if you suspect it's cutting
-anyone real gainers.
-
-Report contents:
-  - Top REPORT_TOP_N members by power gained since the previous run (daily).
-Each line shows: name, current power, (power gained / % gained).
+channel via a webhook, then exits.
 """
-
 import json
 import os
 import sys
@@ -42,93 +12,86 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-
 import requests
 
 MIGHTPULSE_API_KEY = os.environ["MIGHTPULSE_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
-ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))  # top N alliances by power; API caps this at 100
-
+ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
-# How many gainers actually get shown in the Discord report. Discord embeds
-# have a hard 6000-character total-size cap across all fields combined.
-# Was 200 (way over budget on any active kingdom — each line is roughly
-# 40-50 chars, so 200 lines alone can blow past 6000 before accounting for
-# the embed title/description). Dropped to 50, which comfortably fits.
+
 REPORT_TOP_N = int(os.environ.get("REPORT_TOP_N", "50"))
 
-# How many provisional top-gainers get verified with a real per-player call
-# before final ranking. Bounds verification cost to roughly this many calls
-# per run, regardless of kingdom size. Must be comfortably larger than
-# REPORT_TOP_N so the true top N isn't cut by stale roster-based provisional
-# ranking. Unlike REPORT_TOP_N, this has no effect on embed size — it only
-# controls how many members get a verification API call — so it's fine for
-# this to stay much larger than what's displayed.
-VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(REPORT_TOP_N * 50)))
+# Reduced candidate multiplier to prevent running out of the 5,000/day limit
+VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(REPORT_TOP_N * 3)))
 
-# Per-player refetching is done concurrently instead of one-request-at-a-
-# time. RATE_LIMIT_PER_MINUTE caps total calls across all workers so we stay
-# under MightPulse's 60/min limit (with margin); MAX_WORKERS controls how
-# many requests can be in flight at once, which is what actually hides
-# network latency. Both are overridable via env vars if needed.
-RATE_LIMIT_PER_MINUTE = int(os.environ.get("MIGHTPULSE_RATE_LIMIT_PER_MIN", "55"))
-MAX_WORKERS = int(os.environ.get("MIGHTPULSE_MAX_WORKERS", "8"))
+# Paced rate limit configuration
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("MIGHTPULSE_RATE_LIMIT_PER_MIN", "50"))
+MAX_WORKERS = int(os.environ.get("MIGHTPULSE_MAX_WORKERS", "4"))
 
 
 class RateLimiter:
-    """Thread-safe sliding-window limiter: blocks callers so that no more
-    than `max_calls` acquisitions happen in any rolling `period` seconds,
-    no matter how many threads are calling it."""
+    """Thread-safe sliding-window limiter with an explicit minimum interval per call."""
 
-    def __init__(self, max_calls: int, period: float):
+    def __init__(self, max_calls: int, period: float, min_interval: float = 1.1):
         self.max_calls = max_calls
         self.period = period
+        self.min_interval = min_interval
         self.calls: deque[float] = deque()
+        self.last_call = 0.0
         self.lock = threading.Lock()
 
     def acquire(self) -> None:
         while True:
             with self.lock:
                 now = time.monotonic()
+                # Enforce rolling window cap
                 while self.calls and now - self.calls[0] >= self.period:
                     self.calls.popleft()
-                if len(self.calls) < self.max_calls:
+
+                # Enforce explicit 1100ms interval between calls
+                time_since_last = now - self.last_call
+                if len(self.calls) < self.max_calls and time_since_last >= self.min_interval:
                     self.calls.append(now)
+                    self.last_call = now
                     return
-                sleep_for = self.period - (now - self.calls[0])
-            time.sleep(max(sleep_for, 0.01))
+
+                # Calculate appropriate sleep delay
+                sleep_for = max(
+                    self.min_interval - time_since_last,
+                    (self.period - (now - self.calls[0])) if len(self.calls) >= self.max_calls else 0.01
+                )
+            time.sleep(max(sleep_for, 0.05))
 
 
-_rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE, 60.0)
+_rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE, 60.0, min_interval=1.1)
 
 
 def api_get(path: str, params: dict | None = None) -> dict:
-    _rate_limiter.acquire()
     url = f"{API_BASE}{path}"
     headers = {"Authorization": f"Bearer {MIGHTPULSE_API_KEY}"}
 
-    resp = requests.get(url, headers=headers, params=params or {}, timeout=30)
-    if resp.status_code == 429:
-        # brief backoff and one retry if we ever bump the rate limit
-        time.sleep(5)
+    for attempt in range(3):
+        _rate_limiter.acquire()
         resp = requests.get(url, headers=headers, params=params or {}, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"MightPulse API {resp.status_code} on {path}: {resp.text}")
-    return resp.json()
+        
+        if resp.status_code == 429:
+            # Back off aggressively if 429 is hit
+            wait_time = (attempt + 1) * 10
+            print(f"WARNING: Rate limited (429) on {path}. Retrying in {wait_time}s...", file=sys.stderr)
+            time.sleep(wait_time)
+            continue
+            
+        if resp.status_code != 200:
+            raise RuntimeError(f"MightPulse API {resp.status_code} on {path}: {resp.text}")
+        
+        return resp.json()
+
+    raise RuntimeError(f"MightPulse API 429 persisted after retries on {path}")
 
 
 def fetch_top_alliances(kid: str, limit: int = ALLIANCE_LIMIT) -> list[dict]:
-    """Top alliances in this kingdom by power, already ranked by the API.
-    Each entry has at least aid, abbr, name, score per the docs.
-
-    The docs don't spell out the top-level key holding the list for this
-    endpoint. Guessing key names one at a time proved fragile in practice
-    (missed the actual "boards" key first try), so instead this looks
-    structurally for a list of dicts shaped like a documented alliance-board
-    entry — has an "abbr" field — searching top-level values first, then one
-    level of nesting. Fails loudly with the real shape if nothing matches."""
     data = api_get(f"/kingdoms/{kid}/ranks", {"board": "alliance_power", "limit": limit})
 
     def looks_like_alliance_list(value) -> bool:
@@ -148,31 +111,17 @@ def fetch_top_alliances(kid: str, limit: int = ALLIANCE_LIMIT) -> list[dict]:
                 if looks_like_alliance_list(nested):
                     return nested
 
-    raise RuntimeError(
-        f"Couldn't find an alliance list (dicts with 'abbr') in /kingdoms/{kid}/ranks "
-        f"response — got top-level keys {sorted(data.keys())} with types "
-        f"{[(k, type(v).__name__) for k, v in data.items()]}. Inspect the real payload "
-        f"and fix fetch_top_alliances()."
-    )
+    raise RuntimeError(f"Couldn't find an alliance list in response for kingdom {kid}.")
 
 
 def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], list[dict]]:
-    """Fetch every listed alliance's roster concurrently (up to MAX_WORKERS
-    at a time, paced by the shared RateLimiter). Returns (all_members,
-    alliance_infos) — a flat member list across all alliances, plus each
-    alliance's own info dict (for a total-power/member-count summary).
-
-    Roster entries with no governor_id are dropped: these are empty/
-    unfilled roster slots (e.g. vacant officer positions), not real
-    players, and were previously being counted as members with power 0
-    and flooding the logs via sanitize_power()."""
     alliance_infos: list[dict | None] = [None] * len(alliance_tags)
     members_by_index: list[list[dict]] = [[] for _ in alliance_tags]
 
     def fetch_one(i: int, tag: str) -> tuple[int, dict | None, list[dict]]:
         try:
             data = api_get(f"/alliances/{kid}/{tag}", {"include": "info,roster"})
-            return i, data["alliance"], data["members"]
+            return i, data.get("alliance"), data.get("members", [])
         except Exception as exc:
             print(f"WARNING: couldn't fetch roster for alliance {tag}: {exc}", file=sys.stderr)
             return i, None, []
@@ -185,7 +134,6 @@ def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], l
             members_by_index[i] = members
 
     all_members = [m for members in members_by_index for m in members]
-
     real_members = [m for m in all_members if m.get("governor_id") is not None]
     dropped = len(all_members) - len(real_members)
     if dropped:
@@ -196,23 +144,14 @@ def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], l
 
 
 def refresh_members_individually(members: list[dict]) -> list[dict]:
-    """Re-fetch each given member individually for live, accurate
-    power/activity — confirmed necessary (roster power has been observed to
-    lag in practice). The caller scopes `members` to a bounded candidate
-    pool rather than passing everyone, since at kingdom scale (thousands of
-    members across 100 alliances) verifying every member every run isn't
-    feasible under the daily call cap."""
     fresh: list[dict | None] = [None] * len(members)
 
     def fetch_one(i: int, m: dict) -> tuple[int, dict]:
         gid = m["governor_id"]
         try:
             data = api_get(f"/players/{gid}", {"include": "base"})
-            player = data["player"]
+            player = data.get("player", {})
             if player.get("power") is None:
-                # Verification should never make the data worse than roster
-                # already had — a deleted/banned/degenerate account can come
-                # back with power: null. Keep the roster estimate instead.
                 print(
                     f"WARNING: verified data for {m.get('nick_name', gid)} ({gid}) "
                     f"had no power value — keeping roster estimate instead",
@@ -222,7 +161,7 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
             return i, player
         except Exception as exc:
             print(f"WARNING: couldn't refresh {m.get('nick_name', gid)} ({gid}): {exc}", file=sys.stderr)
-            return i, m  # fall back to the (stale) roster entry rather than dropping them
+            return i, m
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(fetch_one, i, m) for i, m in enumerate(members)]
@@ -234,32 +173,20 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
 
 
 def provisional_gain_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
-    """Rank members by power CHANGE using whatever power we currently have
-    (roster data, possibly stale) and return the `pool_size` with the
-    biggest gains (most positive change first). This is a shortlist for
-    verification, not the final ranking — only members with a previous data
-    point can be ranked at all, same as top_gainers()."""
     candidates = [m for m in members if str(m["governor_id"]) in previous]
     candidates.sort(
         key=lambda m: m["power"] - previous[str(m["governor_id"])],
-        reverse=True,  # descending: most positive (biggest gain) first
+        reverse=True,
     )
     return candidates[:pool_size]
 
 
 def apply_verified(members: list[dict], verified: list[dict]) -> list[dict]:
-    """Replace entries in `members` with their verified counterparts (by
-    governor_id), leaving everyone else's roster data untouched."""
     verified_by_gid = {str(m["governor_id"]): m for m in verified}
     return [verified_by_gid.get(str(m["governor_id"]), m) for m in members]
 
 
 def sanitize_power(members: list[dict]) -> list[dict]:
-    """Last-line safety net: a null/missing power value from either the
-    roster or a per-player refresh (e.g. a deleted/banned account) should
-    never crash the whole report. Treat it as 0 and log it loudly rather
-    than masking it — a report that silently drops someone is worse than
-    one that shows them at 0 and lets you go investigate."""
     for m in members:
         if m.get("power") is None:
             gid = m.get("governor_id", "?")
@@ -267,10 +194,6 @@ def sanitize_power(members: list[dict]) -> list[dict]:
             m["power"] = 0
     return members
 
-
-# ---------------------------------------------------------------------------
-# Daily snapshot (previous run -> now)
-# ---------------------------------------------------------------------------
 
 def load_snapshot() -> dict:
     if SNAPSHOT_FILE.exists():
@@ -283,17 +206,12 @@ def save_snapshot(members: list[dict]) -> None:
     SNAPSHOT_FILE.write_text(json.dumps(data, indent=2))
 
 
-# ---------------------------------------------------------------------------
-# Report building
-# ---------------------------------------------------------------------------
-
 def top_gainers(members: list[dict], previous: dict, top_n: int = REPORT_TOP_N) -> list[dict]:
-    """Members with a previous data point, ranked by power gained (desc)."""
     gainers = []
     for m in members:
         gid = str(m["governor_id"])
         if gid not in previous:
-            continue  # can't rank a gain we have no baseline for
+            continue
         prev_power = previous[gid]
         gain = m["power"] - prev_power
         pct = (gain / prev_power * 100) if prev_power else 0.0
@@ -312,20 +230,25 @@ def format_gainer_lines(gainers: list[dict]) -> str:
 
 
 def chunk_field(label: str, text: str, max_len: int = 1000) -> list[dict]:
-    """Split text into <=max_len-char Discord embed fields (code blocks)."""
     fields = []
     chunk = ""
     idx = 1
     for line in text.split("\n"):
-        if len(chunk) + len(line) + 1 > max_len - 6:  # leave room for ``` fences
-            fields.append({"name": f"{label} ({idx})" if idx > 1 else label,
-                            "value": f"```{chunk}```", "inline": False})
+        if len(chunk) + len(line) + 1 > max_len - 6:
+            fields.append({
+                "name": f"{label} ({idx})" if idx > 1 else label,
+                "value": f"```\n{chunk}```",
+                "inline": False
+            })
             chunk = ""
             idx += 1
         chunk += line + "\n"
     if chunk:
-        fields.append({"name": f"{label} ({idx})" if idx > 1 else label,
-                        "value": f"```{chunk}```", "inline": False})
+        fields.append({
+            "name": f"{label} ({idx})" if idx > 1 else label,
+            "value": f"```\n{chunk}```",
+            "inline": False
+        })
     return fields
 
 
@@ -336,7 +259,6 @@ def build_payload(
     daily_previous: dict,
 ) -> dict:
     total_power = sum(m["power"] for m in members)
-
     fields = []
 
     daily_top = top_gainers(members, daily_previous)
@@ -348,7 +270,7 @@ def build_payload(
     embed = {
         "title": f"Kingdom {kingdom_id} — top {alliance_count} alliances power report",
         "description": f"Alliances tracked: {alliance_count} · Members: {len(members)} · Total power: {total_power:,}",
-        "color": 0x5865F2,  # Discord blurple
+        "color": 0x5865F2,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
     }
@@ -371,9 +293,6 @@ def main() -> None:
 
     daily_previous = load_snapshot()
 
-    # Shortlist provisional gainers (roster data, possibly stale) and only
-    # verify that bounded set individually — see module docstring for why
-    # we don't verify everyone.
     candidate_pool: dict[str, dict] = {}
     for m in provisional_gain_candidates(members, daily_previous, VERIFY_CANDIDATE_POOL):
         candidate_pool[str(m["governor_id"])] = m
