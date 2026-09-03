@@ -21,17 +21,15 @@ optional.
 Verifying every member individually doesn't scale to 100 alliances though
 (potentially thousands of members vs. a 5,000/day call cap). So instead:
 roster data is used to compute a *provisional* gain ranking first, then only
-the top VERIFY_CANDIDATE_POOL provisional gainers (daily and weekly pools,
-unioned) get a real per-player refresh, and the final top-20 lists are
-ranked from that verified subset. This assumes the true top 20 gainers are
-within the wider candidate pool even using stale roster numbers — a
-reasonable bet with a 5x-or-more pool, but not a guarantee. Widen
-VERIFY_CANDIDATE_POOL if you suspect it's cutting anyone real gainers.
+the top VERIFY_CANDIDATE_POOL provisional gainers get a real per-player
+refresh, and the final top-N list is ranked from that verified subset. This
+assumes the true top N gainers are within the wider candidate pool even
+using stale roster numbers — a reasonable bet with a 5x-or-more pool, but
+not a guarantee. Widen VERIFY_CANDIDATE_POOL if you suspect it's cutting
+anyone real gainers.
 
 Report contents:
-  - Top 20 members by power gained since the previous run (daily).
-  - Top 20 members by power gained since the weekly baseline, which resets
-    automatically every 7 days.
+  - Top REPORT_TOP_N members by power gained since the previous run (daily).
 Each line shows: name, current power, (power gained / % gained).
 """
 
@@ -54,18 +52,23 @@ ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))  # top N alliances
 
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
-WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
-TOP_N = int(os.environ.get("TOP_N", "200"))
-WEEKLY_RESET_DAYS = 7
+# How many gainers actually get shown in the Discord report. Discord embeds
+# have a hard 6000-character total-size cap across all fields combined.
+# Was 200 (way over budget on any active kingdom — each line is roughly
+# 40-50 chars, so 200 lines alone can blow past 6000 before accounting for
+# the embed title/description). Dropped to 50, which comfortably fits.
+REPORT_TOP_N = int(os.environ.get("REPORT_TOP_N", "50"))
 
-# How many provisional top-gainers (per period: daily, weekly) get verified
-# with a real per-player call before final ranking. Bounds verification cost
-# to roughly 2x this number per run, regardless of kingdom size. Must be
-# comfortably larger than TOP_N so the true top 20 isn't cut by stale
-# roster-based provisional ranking.
-VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(TOP_N * 5)))
+# How many provisional top-gainers get verified with a real per-player call
+# before final ranking. Bounds verification cost to roughly this many calls
+# per run, regardless of kingdom size. Must be comfortably larger than
+# REPORT_TOP_N so the true top N isn't cut by stale roster-based provisional
+# ranking. Unlike REPORT_TOP_N, this has no effect on embed size — it only
+# controls how many members get a verification API call — so it's fine for
+# this to stay much larger than what's displayed.
+VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(REPORT_TOP_N * 50)))
 
-# Per-player refetching is now done concurrently instead of one-request-at-a-
+# Per-player refetching is done concurrently instead of one-request-at-a-
 # time. RATE_LIMIT_PER_MINUTE caps total calls across all workers so we stay
 # under MightPulse's 60/min limit (with margin); MAX_WORKERS controls how
 # many requests can be in flight at once, which is what actually hides
@@ -281,45 +284,10 @@ def save_snapshot(members: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Weekly snapshot (baseline that resets every WEEKLY_RESET_DAYS days)
-# ---------------------------------------------------------------------------
-
-def load_weekly_snapshot() -> dict:
-    if WEEKLY_SNAPSHOT_FILE.exists():
-        return json.loads(WEEKLY_SNAPSHOT_FILE.read_text())
-    return {}
-
-
-def save_weekly_snapshot(members: list[dict], baseline_date: datetime) -> None:
-    data = {
-        "baseline_date": baseline_date.isoformat(),
-        "powers": {str(m["governor_id"]): m["power"] for m in members},
-    }
-    WEEKLY_SNAPSHOT_FILE.write_text(json.dumps(data, indent=2))
-
-
-def get_weekly_baseline(members: list[dict], now: datetime) -> tuple[dict, bool]:
-    """Returns (baseline_powers, just_reset). If no baseline exists yet, or
-    the existing one is >= WEEKLY_RESET_DAYS old, today's powers become the
-    new baseline and just_reset is True (nothing to compare against yet)."""
-    snap = load_weekly_snapshot()
-    if not snap:
-        save_weekly_snapshot(members, now)
-        return {}, True
-
-    baseline_date = datetime.fromisoformat(snap["baseline_date"])
-    if (now - baseline_date).days >= WEEKLY_RESET_DAYS:
-        save_weekly_snapshot(members, now)
-        return {}, True
-
-    return snap["powers"], False
-
-
-# ---------------------------------------------------------------------------
 # Report building
 # ---------------------------------------------------------------------------
 
-def top_gainers(members: list[dict], previous: dict, top_n: int = TOP_N) -> list[dict]:
+def top_gainers(members: list[dict], previous: dict, top_n: int = REPORT_TOP_N) -> list[dict]:
     """Members with a previous data point, ranked by power gained (desc)."""
     gainers = []
     for m in members:
@@ -366,8 +334,6 @@ def build_payload(
     alliance_count: int,
     members: list[dict],
     daily_previous: dict,
-    weekly_previous: dict,
-    weekly_just_reset: bool,
 ) -> dict:
     total_power = sum(m["power"] for m in members)
 
@@ -378,15 +344,6 @@ def build_payload(
         fields.extend(chunk_field(f"Top {len(daily_top)} Daily Gainers", format_gainer_lines(daily_top)))
     else:
         fields.append({"name": "Top Daily Gainers", "value": "No previous snapshot yet — starting today.", "inline": False})
-
-    if weekly_just_reset:
-        fields.append({"name": "Top Weekly Gainers", "value": "Weekly tracking reset today — gains will show starting next run.", "inline": False})
-    else:
-        weekly_top = top_gainers(members, weekly_previous)
-        if weekly_top:
-            fields.extend(chunk_field(f"Top {len(weekly_top)} Weekly Gainers (7d)", format_gainer_lines(weekly_top)))
-        else:
-            fields.append({"name": "Top Weekly Gainers (7d)", "value": "No comparable data yet.", "inline": False})
 
     embed = {
         "title": f"Kingdom {kingdom_id} — top {alliance_count} alliances power report",
@@ -405,8 +362,6 @@ def post_to_discord(payload: dict) -> None:
 
 
 def main() -> None:
-    now = datetime.now(timezone.utc)
-
     top_alliances = fetch_top_alliances(KINGDOM_ID, ALLIANCE_LIMIT)
     alliance_tags = [a["abbr"] for a in top_alliances]
     print(f"Resolved {len(alliance_tags)} top alliances by power in kingdom {KINGDOM_ID}")
@@ -415,17 +370,13 @@ def main() -> None:
     members = sanitize_power(members)
 
     daily_previous = load_snapshot()
-    weekly_previous, weekly_just_reset = get_weekly_baseline(members, now)
 
-    # Shortlist provisional gainers (roster data, possibly stale) for daily
-    # and weekly separately, union them, and only verify that bounded set
-    # individually — see module docstring for why we don't verify everyone.
+    # Shortlist provisional gainers (roster data, possibly stale) and only
+    # verify that bounded set individually — see module docstring for why
+    # we don't verify everyone.
     candidate_pool: dict[str, dict] = {}
     for m in provisional_gain_candidates(members, daily_previous, VERIFY_CANDIDATE_POOL):
         candidate_pool[str(m["governor_id"])] = m
-    if not weekly_just_reset:
-        for m in provisional_gain_candidates(members, weekly_previous, VERIFY_CANDIDATE_POOL):
-            candidate_pool[str(m["governor_id"])] = m
 
     if candidate_pool:
         verified = refresh_members_individually(list(candidate_pool.values()))
@@ -433,10 +384,10 @@ def main() -> None:
         members = sanitize_power(members)
         print(f"Verified {len(verified)} provisional-gainer candidates individually")
 
-    payload = build_payload(KINGDOM_ID, len(alliance_infos), members, daily_previous, weekly_previous, weekly_just_reset)
+    payload = build_payload(KINGDOM_ID, len(alliance_infos), members, daily_previous)
     post_to_discord(payload)
 
-    save_snapshot(members)  # weekly snapshot is only (re)written on reset, inside get_weekly_baseline
+    save_snapshot(members)
 
     print(f"Posted report — {len(alliance_infos)} alliances, {sum(m['power'] for m in members):,} total power, {len(members)} members")
 
