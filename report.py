@@ -157,7 +157,12 @@ def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], l
     """Fetch every listed alliance's roster concurrently (up to MAX_WORKERS
     at a time, paced by the shared RateLimiter). Returns (all_members,
     alliance_infos) — a flat member list across all alliances, plus each
-    alliance's own info dict (for a total-power/member-count summary)."""
+    alliance's own info dict (for a total-power/member-count summary).
+
+    Roster entries with no governor_id are dropped: these are empty/
+    unfilled roster slots (e.g. vacant officer positions), not real
+    players, and were previously being counted as members with power 0
+    and flooding the logs via sanitize_power()."""
     alliance_infos: list[dict | None] = [None] * len(alliance_tags)
     members_by_index: list[list[dict]] = [[] for _ in alliance_tags]
 
@@ -177,8 +182,14 @@ def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], l
             members_by_index[i] = members
 
     all_members = [m for members in members_by_index for m in members]
+
+    real_members = [m for m in all_members if m.get("governor_id") is not None]
+    dropped = len(all_members) - len(real_members)
+    if dropped:
+        print(f"Dropped {dropped} empty/placeholder roster slot(s) with no governor_id", file=sys.stderr)
+
     ok_alliance_infos = [a for a in alliance_infos if a is not None]
-    return all_members, ok_alliance_infos
+    return real_members, ok_alliance_infos
 
 
 def refresh_members_individually(members: list[dict]) -> list[dict]:
@@ -219,16 +230,16 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
     return fresh
 
 
-def provisional_loss_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
+def provisional_gain_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
     """Rank members by power CHANGE using whatever power we currently have
     (roster data, possibly stale) and return the `pool_size` with the
-    biggest losses (most negative change first). This is a shortlist for
+    biggest gains (most positive change first). This is a shortlist for
     verification, not the final ranking — only members with a previous data
-    point can be ranked at all, same as top_losers()."""
+    point can be ranked at all, same as top_gainers()."""
     candidates = [m for m in members if str(m["governor_id"]) in previous]
     candidates.sort(
         key=lambda m: m["power"] - previous[str(m["governor_id"])],
-        reverse=False,  # ascending: most negative (biggest loss) first
+        reverse=True,  # descending: most positive (biggest gain) first
     )
     return candidates[:pool_size]
 
