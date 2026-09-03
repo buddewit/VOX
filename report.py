@@ -194,7 +194,18 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
         gid = m["governor_id"]
         try:
             data = api_get(f"/players/{gid}", {"include": "base"})
-            return i, data["player"]
+            player = data["player"]
+            if player.get("power") is None:
+                # Verification should never make the data worse than roster
+                # already had — a deleted/banned/degenerate account can come
+                # back with power: null. Keep the roster estimate instead.
+                print(
+                    f"WARNING: verified data for {m.get('nick_name', gid)} ({gid}) "
+                    f"had no power value — keeping roster estimate instead",
+                    file=sys.stderr,
+                )
+                return i, m
+            return i, player
         except Exception as exc:
             print(f"WARNING: couldn't refresh {m.get('nick_name', gid)} ({gid}): {exc}", file=sys.stderr)
             return i, m  # fall back to the (stale) roster entry rather than dropping them
@@ -226,6 +237,20 @@ def apply_verified(members: list[dict], verified: list[dict]) -> list[dict]:
     governor_id), leaving everyone else's roster data untouched."""
     verified_by_gid = {str(m["governor_id"]): m for m in verified}
     return [verified_by_gid.get(str(m["governor_id"]), m) for m in members]
+
+
+def sanitize_power(members: list[dict]) -> list[dict]:
+    """Last-line safety net: a null/missing power value from either the
+    roster or a per-player refresh (e.g. a deleted/banned account) should
+    never crash the whole report. Treat it as 0 and log it loudly rather
+    than masking it — a report that silently drops someone is worse than
+    one that shows them at 0 and lets you go investigate."""
+    for m in members:
+        if m.get("power") is None:
+            gid = m.get("governor_id", "?")
+            print(f"WARNING: {m.get('nick_name', gid)} ({gid}) has no power value — treating as 0", file=sys.stderr)
+            m["power"] = 0
+    return members
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +400,7 @@ def main() -> None:
     print(f"Resolved {len(alliance_tags)} top alliances by power in kingdom {KINGDOM_ID}")
 
     members, alliance_infos = fetch_all_rosters(KINGDOM_ID, alliance_tags)
+    members = sanitize_power(members)
 
     daily_previous = load_snapshot()
     weekly_previous, weekly_just_reset = get_weekly_baseline(members, now)
@@ -392,6 +418,7 @@ def main() -> None:
     if candidate_pool:
         verified = refresh_members_individually(list(candidate_pool.values()))
         members = apply_verified(members, verified)
+        members = sanitize_power(members)
         print(f"Verified {len(verified)} provisional-gainer candidates individually")
 
     payload = build_payload(KINGDOM_ID, len(alliance_infos), members, daily_previous, weekly_previous, weekly_just_reset)
