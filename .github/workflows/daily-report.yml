@@ -27,6 +27,13 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
+      - name: Refresh members on mightpulse.com
+        env:
+          MIGHTPULSE_API_KEY: ${{ secrets.MIGHTPULSE_API_KEY }}
+          KINGDOM_ID: ${{ vars.KINGDOM_ID }}
+          ALLIANCE_TAG: ${{ vars.ALLIANCE_TAG }}
+        run: python refresh_members.py
+          
       - name: Run report
         env:
           MIGHTPULSE_API_KEY: ${{ secrets.MIGHTPULSE_API_KEY }}
