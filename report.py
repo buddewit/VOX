@@ -219,15 +219,16 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
     return fresh
 
 
-def provisional_gain_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
-    """Rank members by gain using whatever power we currently have (roster
-    data, possibly stale) and return the top `pool_size`. This is a
-    shortlist for verification, not the final ranking — only members with a
-    previous data point can be ranked at all, same as top_gainers()."""
+def provisional_loss_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
+    """Rank members by loss using whatever power we currently have (roster
+    data, possibly stale) and return the top `pool_size` biggest losers.
+    This is a shortlist for verification, not the final ranking — only
+    members with a previous data point can be ranked at all, same as
+    top_losers()."""
     candidates = [m for m in members if str(m["governor_id"]) in previous]
     candidates.sort(
         key=lambda m: m["power"] - previous[str(m["governor_id"])],
-        reverse=True,
+        reverse=False,
     )
     return candidates[:pool_size]
 
@@ -307,24 +308,25 @@ def get_weekly_baseline(members: list[dict], now: datetime) -> tuple[dict, bool]
 # Report building
 # ---------------------------------------------------------------------------
 
-def top_gainers(members: list[dict], previous: dict, top_n: int = TOP_N) -> list[dict]:
-    """Members with a previous data point, ranked by power gained (desc)."""
-    gainers = []
+def top_losers(members: list[dict], previous: dict, top_n: int = TOP_N) -> list[dict]:
+    """Members with a previous data point, ranked by power lost (most
+    negative gain first)."""
+    losers = []
     for m in members:
         gid = str(m["governor_id"])
         if gid not in previous:
-            continue  # can't rank a gain we have no baseline for
+            continue  # can't rank a change we have no baseline for
         prev_power = previous[gid]
         gain = m["power"] - prev_power
         pct = (gain / prev_power * 100) if prev_power else 0.0
-        gainers.append({**m, "gain": gain, "pct": pct})
-    gainers.sort(key=lambda m: m["gain"], reverse=True)
-    return gainers[:top_n]
+        losers.append({**m, "gain": gain, "pct": pct})
+    losers.sort(key=lambda m: m["gain"], reverse=False)
+    return losers[:top_n]
 
 
-def format_gainer_lines(gainers: list[dict]) -> str:
+def format_loser_lines(losers: list[dict]) -> str:
     lines = []
-    for m in gainers:
+    for m in losers:
         lines.append(
             f"{m['nick_name']:<20} {m['power']:>12,}  ({m['gain']:+,} / {m['pct']:+.1f}%)"
         )
@@ -361,20 +363,20 @@ def build_payload(
 
     fields = []
 
-    daily_top = top_gainers(members, daily_previous)
+    daily_top = top_losers(members, daily_previous)
     if daily_top:
-        fields.extend(chunk_field(f"Top {len(daily_top)} Daily Gainers", format_gainer_lines(daily_top)))
+        fields.extend(chunk_field(f"Top {len(daily_top)} Daily Losers", format_loser_lines(daily_top)))
     else:
-        fields.append({"name": "Top Daily Gainers", "value": "No previous snapshot yet — starting today.", "inline": False})
+        fields.append({"name": "Top Daily Losers", "value": "No previous snapshot yet — starting today.", "inline": False})
 
     if weekly_just_reset:
-        fields.append({"name": "Top Weekly Gainers", "value": "Weekly tracking reset today — gains will show starting next run.", "inline": False})
+        fields.append({"name": "Top Weekly Losers", "value": "Weekly tracking reset today — changes will show starting next run.", "inline": False})
     else:
-        weekly_top = top_gainers(members, weekly_previous)
+        weekly_top = top_losers(members, weekly_previous)
         if weekly_top:
-            fields.extend(chunk_field(f"Top {len(weekly_top)} Weekly Gainers (7d)", format_gainer_lines(weekly_top)))
+            fields.extend(chunk_field(f"Top {len(weekly_top)} Weekly Losers (7d)", format_loser_lines(weekly_top)))
         else:
-            fields.append({"name": "Top Weekly Gainers (7d)", "value": "No comparable data yet.", "inline": False})
+            fields.append({"name": "Top Weekly Losers (7d)", "value": "No comparable data yet.", "inline": False})
 
     embed = {
         "title": f"Kingdom {kingdom_id} — top {alliance_count} alliances power report",
@@ -405,21 +407,21 @@ def main() -> None:
     daily_previous = load_snapshot()
     weekly_previous, weekly_just_reset = get_weekly_baseline(members, now)
 
-    # Shortlist provisional gainers (roster data, possibly stale) for daily
+    # Shortlist provisional losers (roster data, possibly stale) for daily
     # and weekly separately, union them, and only verify that bounded set
     # individually — see module docstring for why we don't verify everyone.
     candidate_pool: dict[str, dict] = {}
-    for m in provisional_gain_candidates(members, daily_previous, VERIFY_CANDIDATE_POOL):
+    for m in provisional_loss_candidates(members, daily_previous, VERIFY_CANDIDATE_POOL):
         candidate_pool[str(m["governor_id"])] = m
     if not weekly_just_reset:
-        for m in provisional_gain_candidates(members, weekly_previous, VERIFY_CANDIDATE_POOL):
+        for m in provisional_loss_candidates(members, weekly_previous, VERIFY_CANDIDATE_POOL):
             candidate_pool[str(m["governor_id"])] = m
 
     if candidate_pool:
         verified = refresh_members_individually(list(candidate_pool.values()))
         members = apply_verified(members, verified)
         members = sanitize_power(members)
-        print(f"Verified {len(verified)} provisional-gainer candidates individually")
+        print(f"Verified {len(verified)} provisional-loser candidates individually")
 
     payload = build_payload(KINGDOM_ID, len(alliance_infos), members, daily_previous, weekly_previous, weekly_just_reset)
     post_to_discord(payload)
@@ -435,4 +437,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-      
+  
