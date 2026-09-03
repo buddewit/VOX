@@ -55,7 +55,7 @@ ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))  # top N alliances
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
 WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
-TOP_N = 20
+TOP_N = int(os.environ.get("TOP_N", "200"))
 WEEKLY_RESET_DAYS = 7
 
 # How many provisional top-gainers (per period: daily, weekly) get verified
@@ -219,15 +219,16 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
     return fresh
 
 
-def provisional_gain_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
-    """Rank members by gain using whatever power we currently have (roster
-    data, possibly stale) and return the top `pool_size`. This is a
-    shortlist for verification, not the final ranking — only members with a
-    previous data point can be ranked at all, same as top_gainers()."""
+def provisional_loss_candidates(members: list[dict], previous: dict, pool_size: int) -> list[dict]:
+    """Rank members by power CHANGE using whatever power we currently have
+    (roster data, possibly stale) and return the `pool_size` with the
+    biggest losses (most negative change first). This is a shortlist for
+    verification, not the final ranking — only members with a previous data
+    point can be ranked at all, same as top_losers()."""
     candidates = [m for m in members if str(m["governor_id"]) in previous]
     candidates.sort(
         key=lambda m: m["power"] - previous[str(m["governor_id"])],
-        reverse=True,
+        reverse=False,  # ascending: most negative (biggest loss) first
     )
     return candidates[:pool_size]
 
