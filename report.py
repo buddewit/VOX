@@ -121,19 +121,35 @@ def fetch_top_alliances(kid: str, limit: int = ALLIANCE_LIMIT) -> list[dict]:
     Each entry has at least aid, abbr, name, score per the docs.
 
     The docs don't spell out the top-level key holding the list for this
-    endpoint (unlike e.g. the roster endpoint, which is documented down to
-    field names), so we try the most likely candidates and fail loudly with
-    the actual response shape if none match — better than silently guessing
-    wrong and returning an empty/garbage alliance list."""
+    endpoint. Guessing key names one at a time proved fragile in practice
+    (missed the actual "boards" key first try), so instead this looks
+    structurally for a list of dicts shaped like a documented alliance-board
+    entry — has an "abbr" field — searching top-level values first, then one
+    level of nesting. Fails loudly with the real shape if nothing matches."""
     data = api_get(f"/kingdoms/{kid}/ranks", {"board": "alliance_power", "limit": limit})
-    for key in ("ranks", "board", "results", "items", "leaderboard", "data"):
-        value = data.get(key)
-        if isinstance(value, list):
+
+    def looks_like_alliance_list(value) -> bool:
+        return (
+            isinstance(value, list)
+            and len(value) > 0
+            and all(isinstance(item, dict) and "abbr" in item for item in value)
+        )
+
+    for value in data.values():
+        if looks_like_alliance_list(value):
             return value
+
+    for value in data.values():
+        if isinstance(value, dict):
+            for nested in value.values():
+                if looks_like_alliance_list(nested):
+                    return nested
+
     raise RuntimeError(
-        f"Couldn't find the alliance list in /kingdoms/{kid}/ranks response "
-        f"— got top-level keys {sorted(data.keys())}. Check the actual response "
-        f"shape and add the right key to fetch_top_alliances()."
+        f"Couldn't find an alliance list (dicts with 'abbr') in /kingdoms/{kid}/ranks "
+        f"response — got top-level keys {sorted(data.keys())} with types "
+        f"{[(k, type(v).__name__) for k, v in data.items()]}. Inspect the real payload "
+        f"and fix fetch_top_alliances()."
     )
 
 
