@@ -19,7 +19,7 @@ import requests
 MIGHTPULSE_API_KEY = os.environ["MIGHTPULSE_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
-ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "100"))
+ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "50"))
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
 
