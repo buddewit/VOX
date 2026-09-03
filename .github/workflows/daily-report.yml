@@ -12,6 +12,7 @@ permissions:
 jobs:
   report:
     runs-on: ubuntu-latest
+    timeout-minutes: 240  # Overrides default 360m limit; ensures full ~2.5h scan isn't killed prematurely
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
