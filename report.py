@@ -53,7 +53,7 @@ KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
 ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "50"))  # top N alliances by power; API caps this at 100
 
 API_BASE = "https://api.mightpulse.com/v1"
-SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot2.json"
+SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
 WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
 TOP_N = 50
 WEEKLY_RESET_DAYS = 7
@@ -326,8 +326,10 @@ def get_weekly_baseline(members: list[dict], now: datetime) -> tuple[dict, bool]
 # ---------------------------------------------------------------------------
 
 def top_losers(members: list[dict], previous: dict, top_n: int = TOP_N) -> list[dict]:
-    """Members with a previous data point, ranked by power lost (most
-    negative gain first)."""
+    """Members with a previous data point AND an actual power loss
+    (gain < 0), ranked biggest loss first. Members who gained or stayed
+    flat are never included, even if there aren't top_n real losers to
+    fill the list."""
     losers = []
     for m in members:
         gid = str(m["governor_id"])
@@ -335,19 +337,36 @@ def top_losers(members: list[dict], previous: dict, top_n: int = TOP_N) -> list[
             continue  # can't rank a change we have no baseline for
         prev_power = previous[gid]
         gain = m["power"] - prev_power
+        if gain >= 0:
+            continue  # not a loss — never show gains in this report
         pct = (gain / prev_power * 100) if prev_power else 0.0
         losers.append({**m, "gain": gain, "pct": pct})
     losers.sort(key=lambda m: m["gain"], reverse=False)
     return losers[:top_n]
 
 
+def format_power(value: int) -> str:
+    """Compact power display: 10423288 -> "10,4M". Uses a comma as the
+    decimal separator (NL style); falls back to a plain thousands-grouped
+    number below 1,000."""
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    for suffix, divisor in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        if value >= divisor:
+            return f"{sign}{value / divisor:.1f}{suffix}".replace(".", ",")
+    return f"{sign}{value:,}"
+
+
 def format_loser_lines(losers: list[dict]) -> str:
     lines = []
     for m in losers:
         tag = m.get("alliance_tag") or "?"
+        gain_str = format_power(m["gain"])
+        if m["gain"] >= 0:
+            gain_str = f"+{gain_str}"
         lines.append(
-            f"[{tag:<{ALLIANCE_TAG_COL_WIDTH}}] {m['nick_name']:<20} {m['power']:>12,}  "
-            f"({m['gain']:+,} / {m['pct']:+.1f}%)"
+            f"[{tag:<{ALLIANCE_TAG_COL_WIDTH}}] {m['nick_name']:<20} {format_power(m['power']):>8}  "
+            f"({gain_str} / {m['pct']:+.1f}%)"
         )
     return "\n".join(lines)
 
@@ -399,7 +418,7 @@ def build_payload(
 
     embed = {
         "title": f"Kingdom {kingdom_id} — top {alliance_count} alliances power report",
-        "description": f"Alliances tracked: {alliance_count} · Members: {len(members)} · Total power: {total_power:,}",
+        "description": f"Alliances tracked: {alliance_count} · Members: {len(members)} · Total power: {format_power(total_power)}",
         "color": 0x5865F2,  # Discord blurple
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
