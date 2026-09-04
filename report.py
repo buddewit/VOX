@@ -55,7 +55,7 @@ ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "50"))  # top N alliances 
 API_BASE = "https://api.mightpulse.com/v1"
 SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot2.json"
 WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
-TOP_N = 20
+TOP_N = 50
 WEEKLY_RESET_DAYS = 7
 
 # How many provisional top-gainers (per period: daily, weekly) get verified
