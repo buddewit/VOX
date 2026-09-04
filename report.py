@@ -53,7 +53,7 @@ KINGDOM_ID = os.environ.get("KINGDOM_ID", "2423")
 ALLIANCE_LIMIT = int(os.environ.get("ALLIANCE_LIMIT", "50"))  # top N alliances by power; API caps this at 100
 
 API_BASE = "https://api.mightpulse.com/v1"
-SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot.json"
+SNAPSHOT_FILE = Path(__file__).parent / "last_snapshot2.json"
 WEEKLY_SNAPSHOT_FILE = Path(__file__).parent / "weekly_snapshot.json"
 TOP_N = 20
 WEEKLY_RESET_DAYS = 7
