@@ -32,7 +32,7 @@ Report contents:
   - Top 20 members by power gained since the previous run (daily).
   - Top 20 members by power gained since the weekly baseline, which resets
     automatically every 7 days.
-Each line shows: name, current power, (power gained / % gained).
+Each line shows: alliance tag, name, current power, (power gained / % gained).
 """
 
 import json
@@ -72,6 +72,9 @@ VERIFY_CANDIDATE_POOL = int(os.environ.get("VERIFY_CANDIDATE_POOL", str(TOP_N * 
 # network latency. Both are overridable via env vars if needed.
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("MIGHTPULSE_RATE_LIMIT_PER_MIN", "55"))
 MAX_WORKERS = int(os.environ.get("MIGHTPULSE_MAX_WORKERS", "8"))
+
+# Longest alliance tag we expect, for column alignment in report lines.
+ALLIANCE_TAG_COL_WIDTH = int(os.environ.get("ALLIANCE_TAG_COL_WIDTH", "4"))
 
 
 class RateLimiter:
@@ -157,14 +160,23 @@ def fetch_all_rosters(kid: str, alliance_tags: list[str]) -> tuple[list[dict], l
     """Fetch every listed alliance's roster concurrently (up to MAX_WORKERS
     at a time, paced by the shared RateLimiter). Returns (all_members,
     alliance_infos) — a flat member list across all alliances, plus each
-    alliance's own info dict (for a total-power/member-count summary)."""
+    alliance's own info dict (for a total-power/member-count summary).
+
+    Each member dict gets an "alliance_tag" key stamped on here, since the
+    per-alliance roster endpoint is the only place that association is
+    available — once members are flattened into one list (or later replaced
+    by a per-player refresh, which has no alliance field), that link is
+    otherwise lost."""
     alliance_infos: list[dict | None] = [None] * len(alliance_tags)
     members_by_index: list[list[dict]] = [[] for _ in alliance_tags]
 
     def fetch_one(i: int, tag: str) -> tuple[int, dict | None, list[dict]]:
         try:
             data = api_get(f"/alliances/{kid}/{tag}", {"include": "info,roster"})
-            return i, data["alliance"], data["members"]
+            members = data["members"]
+            for m in members:
+                m["alliance_tag"] = tag
+            return i, data["alliance"], members
         except Exception as exc:
             print(f"WARNING: couldn't fetch roster for alliance {tag}: {exc}", file=sys.stderr)
             return i, None, []
@@ -187,7 +199,11 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
     lag in practice). The caller scopes `members` to a bounded candidate
     pool rather than passing everyone, since at kingdom scale (thousands of
     members across 100 alliances) verifying every member every run isn't
-    feasible under the daily call cap."""
+    feasible under the daily call cap.
+
+    The /players/{gid} response has no alliance field, so alliance_tag is
+    copied over from the roster entry we already had for this member before
+    it gets replaced."""
     fresh: list[dict | None] = [None] * len(members)
 
     def fetch_one(i: int, m: dict) -> tuple[int, dict]:
@@ -205,6 +221,7 @@ def refresh_members_individually(members: list[dict]) -> list[dict]:
                     file=sys.stderr,
                 )
                 return i, m
+            player["alliance_tag"] = m.get("alliance_tag")
             return i, player
         except Exception as exc:
             print(f"WARNING: couldn't refresh {m.get('nick_name', gid)} ({gid}): {exc}", file=sys.stderr)
@@ -327,8 +344,10 @@ def top_losers(members: list[dict], previous: dict, top_n: int = TOP_N) -> list[
 def format_loser_lines(losers: list[dict]) -> str:
     lines = []
     for m in losers:
+        tag = m.get("alliance_tag") or "?"
         lines.append(
-            f"{m['nick_name']:<20} {m['power']:>12,}  ({m['gain']:+,} / {m['pct']:+.1f}%)"
+            f"[{tag:<{ALLIANCE_TAG_COL_WIDTH}}] {m['nick_name']:<20} {m['power']:>12,}  "
+            f"({m['gain']:+,} / {m['pct']:+.1f}%)"
         )
     return "\n".join(lines)
 
@@ -437,4 +456,3 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
-  
